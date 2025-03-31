@@ -1,0 +1,6 @@
+# .trivyignore
+# Add CVE IDs to ignore specific vulnerabilities
+# Format: One CVE ID per line
+# Example:
+# CVE-2021-12345
+# CVE-2022-67890
