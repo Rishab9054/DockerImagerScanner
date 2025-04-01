@@ -10,57 +10,70 @@ if [[ "$1" == "push" ]]; then
   # Get the image name and tag
   IMAGE_NAME="$2"
   
-  # Extract username and repository from the image name
-  USERNAME=$(echo $IMAGE_NAME | cut -d'/' -f1)
-  REPO=$(echo $IMAGE_NAME | cut -d'/' -f2 | cut -d':' -f1)
-  TAG=$(echo $IMAGE_NAME | cut -d':' -f2)
-  
-  if [[ -z "$TAG" ]]; then
-    TAG="latest"
-  fi
-  
-  echo "Triggering GitHub Action for image: $USERNAME/$REPO:$TAG"
-  
-  # Create a Windows-compatible temporary directory
-  if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
-    # Windows path handling
-    TEMP_DIR=$(mktemp -d -p "${TEMP:-/tmp}" docker_scan.XXXXXXXX)
-    # Convert to Windows path if needed
-    TAR_FILE="$TEMP_DIR/image.tar"
-    # Create the directory explicitly to ensure it exists
-    mkdir -p "$TEMP_DIR"
-  else
-    # Unix systems
-    TEMP_DIR=$(mktemp -d)
-    TAR_FILE="$TEMP_DIR/image.tar"
-  fi
-  
-  echo "Saving image to $TAR_FILE..."
-  docker save "$IMAGE_NAME" -o "$TAR_FILE"
-  
-  # Check if the image was saved successfully
-  if [ ! -f "$TAR_FILE" ]; then
-    echo "Failed to save the Docker image to $TAR_FILE"
-    echo "Checking if the image exists..."
-    docker image inspect "$IMAGE_NAME" >/dev/null 2>&1
-    if [ $? -ne 0 ]; then
-      echo "Error: Image $IMAGE_NAME does not exist."
-      exit 1
-    fi
+  # Check if the image exists locally
+  if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+    echo "Error: Image $IMAGE_NAME does not exist locally."
     exit 1
   fi
   
+  echo "Triggering GitHub Action for image: $IMAGE_NAME"
+  
+  # Create a temporary repository for this run
+  TEMP_REPO="temp-scan-repo-$(date +%s)"
+  mkdir -p $TEMP_REPO
+  
+  # Save the image to a tar file
+  echo "Saving image $IMAGE_NAME to a tar file..."
+  docker save "$IMAGE_NAME" -o "$TEMP_REPO/image.tar"
+  
+  # Create a Dockerfile that simply loads the image
+  cat > "$TEMP_REPO/Dockerfile" << EOF
+FROM scratch
+ADD image.tar /
+EOF
+  
+  # Create an archive of the temp repository
+  echo "Creating archive of the image..."
+  tar -czf temp-repo.tar.gz $TEMP_REPO
+  
+  # Push to GitHub repository as a commit
+  echo "Pushing image data to GitHub..."
+  # Add the files to git
+  git -C "$TEMP_REPO" init
+  git -C "$TEMP_REPO" add .
+  git -C "$TEMP_REPO" config user.email "auto@example.com"
+  git -C "$TEMP_REPO" config user.name "Docker Scanner"
+  git -C "$TEMP_REPO" commit -m "Temporary image scan for $IMAGE_NAME"
+  
+  # Push to a temporary branch in the repository
+  TEMP_BRANCH="temp-scan-branch-$(date +%s)"
+  git -C "$TEMP_REPO" branch -M $TEMP_BRANCH
+  
+  # Get the remote URL
+  REPO_URL=$(gh repo view --json url -q .url)
+  git -C "$TEMP_REPO" remote add origin $REPO_URL
+  GH_TOKEN=$(gh auth token)
+  git -C "$TEMP_REPO" -c http.extraHeader="Authorization: Bearer $GH_TOKEN" push -u origin $TEMP_BRANCH
+  
   # Use GitHub CLI to trigger a workflow
   echo "Triggering GitHub workflow..."
-  gh workflow run docker-security-scan.yml -f image_name="$IMAGE_NAME" -f tar_file="$TAR_FILE"
+  gh workflow run docker-security-scan.yml -f image_name="$IMAGE_NAME" -f branch_name="$TEMP_BRANCH"
   
   # Wait for the workflow to complete
   echo "Waiting for workflow to complete..."
+  sleep 3 # Give GitHub API time to register the new run
   WORKFLOW_ID=$(gh run list --workflow=docker-security-scan.yml --limit=1 --json databaseId --jq '.[0].databaseId')
+  
+  if [[ -z "$WORKFLOW_ID" ]]; then
+    echo "Error: Could not get workflow run ID. Please check your GitHub CLI configuration."
+    exit 1
+  fi
+  
+  echo "Monitoring workflow run ID: $WORKFLOW_ID"
   
   # Poll for completion
   while true; do
-    STATUS=$(gh run view $WORKFLOW_ID --json status --jq '.status')
+    STATUS=$(gh run view $WORKFLOW_ID --json status --jq '.status' 2>/dev/null)
     if [[ "$STATUS" == "completed" ]]; then
       break
     fi
@@ -71,6 +84,10 @@ if [[ "$1" == "push" ]]; then
   # Check workflow conclusion
   CONCLUSION=$(gh run view $WORKFLOW_ID --json conclusion --jq '.conclusion')
   
+  # Clean up the temporary repository
+  rm -rf $TEMP_REPO
+  git push origin --delete $TEMP_BRANCH || echo "Failed to delete temporary branch, it will be cleaned up later"
+  
   if [[ "$CONCLUSION" == "success" ]]; then
     echo "✅ Security scan passed! Pushing image to Docker Hub..."
     $(which docker) push "$IMAGE_NAME"
@@ -79,9 +96,6 @@ if [[ "$1" == "push" ]]; then
     echo "❌ Security scan failed! Image not pushed to Docker Hub."
     echo "❌ Check the workflow logs for details: https://github.com/Rishab9054/DockerImagerScanner/actions/runs/$WORKFLOW_ID"
   fi
-  
-  # Clean up
-  rm -rf "$TEMP_DIR"
 else
   # If not a push command, pass through to the real Docker command
   $(which docker) "$@"
