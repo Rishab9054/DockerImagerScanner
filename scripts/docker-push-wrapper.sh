@@ -20,11 +20,14 @@ if [[ "$1" == "push" ]]; then
   
   # Create a temporary repository for this run
   TEMP_REPO="temp-scan-repo-$(date +%s)"
-  mkdir -p $TEMP_REPO
+  mkdir -p "$TEMP_REPO"
   
-  # Save the image to a tar file
+  # Create directory for the tar file
+  mkdir -p /tmp/docker-images
+  
+  # Save the image to a tar file in /tmp/docker-images
   echo "Saving image $IMAGE_NAME to a tar file..."
-  docker save "$IMAGE_NAME" -o "$TEMP_REPO/image.tar"
+  docker save "$IMAGE_NAME" -o "/tmp/docker-images/image.tar"
   
   # Create a Dockerfile that simply loads the image
   cat > "$TEMP_REPO/Dockerfile" << EOF
@@ -32,9 +35,12 @@ FROM scratch
 ADD image.tar /
 EOF
   
+  # Copy the tar file into the temp repo for the archive
+  cp /tmp/docker-images/image.tar "$TEMP_REPO/image.tar"
+  
   # Create an archive of the temp repository
   echo "Creating archive of the image..."
-  tar -czf temp-repo.tar.gz $TEMP_REPO
+  tar -czf temp-repo.tar.gz "$TEMP_REPO"
   
   # Push to GitHub repository as a commit
   echo "Pushing image data to GitHub..."
@@ -47,13 +53,13 @@ EOF
   
   # Push to a temporary branch in the repository
   TEMP_BRANCH="temp-scan-branch-$(date +%s)"
-  git -C "$TEMP_REPO" branch -M $TEMP_BRANCH
+  git -C "$TEMP_REPO" branch -M "$TEMP_BRANCH"
   
   # Get the remote URL
   REPO_URL=$(gh repo view --json url -q .url)
-  git -C "$TEMP_REPO" remote add origin $REPO_URL
+  git -C "$TEMP_REPO" remote add origin "$REPO_URL"
   GH_TOKEN=$(gh auth token)
-  git -C "$TEMP_REPO" -c http.extraHeader="Authorization: Bearer $GH_TOKEN" push -u origin $TEMP_BRANCH
+  git -C "$TEMP_REPO" -c http.extraHeader="Authorization: Bearer $GH_TOKEN" push -u origin "$TEMP_BRANCH"
   
   # Use GitHub CLI to trigger a workflow
   echo "Triggering GitHub workflow..."
@@ -73,7 +79,7 @@ EOF
   
   # Poll for completion
   while true; do
-    STATUS=$(gh run view $WORKFLOW_ID --json status --jq '.status' 2>/dev/null)
+    STATUS=$(gh run view "$WORKFLOW_ID" --json status --jq '.status' 2>/dev/null)
     if [[ "$STATUS" == "completed" ]]; then
       break
     fi
@@ -82,11 +88,12 @@ EOF
   done
   
   # Check workflow conclusion
-  CONCLUSION=$(gh run view $WORKFLOW_ID --json conclusion --jq '.conclusion')
+  CONCLUSION=$(gh run view "$WORKFLOW_ID" --json conclusion --jq '.conclusion')
   
-  # Clean up the temporary repository
-  rm -rf $TEMP_REPO
-  git push origin --delete $TEMP_BRANCH || echo "Failed to delete temporary branch, it will be cleaned up later"
+  # Clean up the temporary repository and tar file
+  rm -rf "$TEMP_REPO"
+  rm -f /tmp/docker-images/image.tar
+  git push origin --delete "$TEMP_BRANCH" || echo "Failed to delete temporary branch, it will be cleaned up later"
   
   if [[ "$CONCLUSION" == "success" ]]; then
     echo "✅ Security scan passed! Pushing image to Docker Hub..."
