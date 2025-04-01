@@ -21,12 +21,34 @@ if [[ "$1" == "push" ]]; then
   
   echo "Triggering GitHub Action for image: $USERNAME/$REPO:$TAG"
   
-  # Save the image to a tar file
-  TEMP_DIR=$(mktemp -d)
-  TAR_FILE="$TEMP_DIR/image.tar"
+  # Create a Windows-compatible temporary directory
+  if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+    # Windows path handling
+    TEMP_DIR=$(mktemp -d -p "${TEMP:-/tmp}" docker_scan.XXXXXXXX)
+    # Convert to Windows path if needed
+    TAR_FILE="$TEMP_DIR/image.tar"
+    # Create the directory explicitly to ensure it exists
+    mkdir -p "$TEMP_DIR"
+  else
+    # Unix systems
+    TEMP_DIR=$(mktemp -d)
+    TAR_FILE="$TEMP_DIR/image.tar"
+  fi
   
   echo "Saving image to $TAR_FILE..."
   docker save "$IMAGE_NAME" -o "$TAR_FILE"
+  
+  # Check if the image was saved successfully
+  if [ ! -f "$TAR_FILE" ]; then
+    echo "Failed to save the Docker image to $TAR_FILE"
+    echo "Checking if the image exists..."
+    docker image inspect "$IMAGE_NAME" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+      echo "Error: Image $IMAGE_NAME does not exist."
+      exit 1
+    fi
+    exit 1
+  fi
   
   # Use GitHub CLI to trigger a workflow
   echo "Triggering GitHub workflow..."
