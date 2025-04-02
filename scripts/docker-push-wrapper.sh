@@ -3,107 +3,98 @@
 # docker-push-wrapper.sh
 # Place this in your PATH, named 'docker-push'
 
-# Check if the command is trying to push an image
+# Extract the image name (remove the 'push' if it was accidentally included)
 if [[ "$1" == "push" ]]; then
-  echo "Intercepting Docker push command..."
-  
-  # Get the image name and tag
   IMAGE_NAME="$2"
-  
-  # Check if the image exists locally
-  if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-    echo "Error: Image $IMAGE_NAME does not exist locally."
-    exit 1
-  fi
-  
-  echo "Triggering GitHub Action for image: $IMAGE_NAME"
-  
-  # Create a temporary repository for this run
-  TEMP_REPO="temp-scan-repo-$(date +%s)"
-  mkdir -p "$TEMP_REPO"
-  
-  # Create directory for the tar file
-  mkdir -p /tmp/docker-images
-  
-  # Save the image to a tar file in /tmp/docker-images
-  echo "Saving image $IMAGE_NAME to a tar file..."
-  docker save "$IMAGE_NAME" -o "/tmp/docker-images/image.tar"
-  
-  # Create a Dockerfile that simply loads the image
-  cat > "$TEMP_REPO/Dockerfile" << EOF
-FROM scratch
-ADD image.tar /
-EOF
-  
-  # Copy the tar file into the temp repo for the archive
-  cp /tmp/docker-images/image.tar "$TEMP_REPO/image.tar"
-  
-  # Create an archive of the temp repository
-  echo "Creating archive of the image..."
-  tar -czf temp-repo.tar.gz "$TEMP_REPO"
-  
-  # Push to GitHub repository as a commit
-  echo "Pushing image data to GitHub..."
-  # Add the files to git
-  git -C "$TEMP_REPO" init
-  git -C "$TEMP_REPO" add .
-  git -C "$TEMP_REPO" config user.email "auto@example.com"
-  git -C "$TEMP_REPO" config user.name "Docker Scanner"
-  git -C "$TEMP_REPO" commit -m "Temporary image scan for $IMAGE_NAME"
-  
-  # Push to a temporary branch in the repository
-  TEMP_BRANCH="temp-scan-branch-$(date +%s)"
-  git -C "$TEMP_REPO" branch -M "$TEMP_BRANCH"
-  
-  # Get the remote URL
-  REPO_URL=$(gh repo view --json url -q .url)
-  git -C "$TEMP_REPO" remote add origin "$REPO_URL"
-  GH_TOKEN=$(gh auth token)
-  git -C "$TEMP_REPO" -c http.extraHeader="Authorization: Bearer $GH_TOKEN" push -u origin "$TEMP_BRANCH"
-  
-  # Use GitHub CLI to trigger a workflow
-  echo "Triggering GitHub workflow..."
-  gh workflow run docker-security-scan.yml -f image_name="$IMAGE_NAME" -f branch_name="$TEMP_BRANCH"
-  
-  # Wait for the workflow to complete
-  echo "Waiting for workflow to complete..."
-  sleep 3 # Give GitHub API time to register the new run
-  WORKFLOW_ID=$(gh run list --workflow=docker-security-scan.yml --limit=1 --json databaseId --jq '.[0].databaseId')
-  
-  if [[ -z "$WORKFLOW_ID" ]]; then
-    echo "Error: Could not get workflow run ID. Please check your GitHub CLI configuration."
-    exit 1
-  fi
-  
-  echo "Monitoring workflow run ID: $WORKFLOW_ID"
-  
-  # Poll for completion
-  while true; do
-    STATUS=$(gh run view "$WORKFLOW_ID" --json status --jq '.status' 2>/dev/null)
-    if [[ "$STATUS" == "completed" ]]; then
-      break
-    fi
-    echo "Workflow status: $STATUS"
-    sleep 5
-  done
-  
-  # Check workflow conclusion
-  CONCLUSION=$(gh run view "$WORKFLOW_ID" --json conclusion --jq '.conclusion')
-  
-  # Clean up the temporary repository and tar file
-  rm -rf "$TEMP_REPO"
-  rm -f /tmp/docker-images/image.tar
-  git push origin --delete "$TEMP_BRANCH" || echo "Failed to delete temporary branch, it will be cleaned up later"
-  
-  if [[ "$CONCLUSION" == "success" ]]; then
-    echo "✅ Security scan passed! Pushing image to Docker Hub..."
-    $(which docker) push "$IMAGE_NAME"
-    echo "✅ Successfully pushed $IMAGE_NAME to Docker Hub"
-  else
-    echo "❌ Security scan failed! Image not pushed to Docker Hub."
-    echo "❌ Check the workflow logs for details: https://github.com/Rishab9054/DockerImagerScanner/actions/runs/$WORKFLOW_ID"
-  fi
 else
-  # If not a push command, pass through to the real Docker command
-  $(which docker) "$@"
+  IMAGE_NAME="$1"
+fi
+
+echo "Intercepting Docker push command..."
+echo "Triggering GitHub Action for image: $IMAGE_NAME"
+
+# Check if the image exists locally
+if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+  echo "Error: Image $IMAGE_NAME does not exist locally."
+  exit 1
+fi
+
+# Create a temporary branch name
+TEMP_BRANCH="temp-scan-branch-$(date +%s)"
+
+# Create a temporary directory
+TEMP_DIR=$(mktemp -d)
+cd "$TEMP_DIR" || exit 1
+
+# Initialize a git repository
+git init
+git config user.email "auto@example.com"
+git config user.name "Docker Scanner"
+
+# Create a simple Dockerfile that uses the image
+echo "FROM $IMAGE_NAME" > Dockerfile
+
+# Commit the Dockerfile
+git add Dockerfile
+git commit -m "Temporary scan for $IMAGE_NAME"
+git branch -M "$TEMP_BRANCH"
+
+# Get the GitHub repository URL using GitHub CLI
+REPO_URL=$(gh repo view --json url -q .url)
+if [[ -z "$REPO_URL" ]]; then
+  echo "Error: Could not get GitHub repository URL. Make sure you're authenticated with GitHub CLI."
+  exit 1
+fi
+
+# Push to the repository
+git remote add origin "$REPO_URL"
+GH_TOKEN=$(gh auth token)
+git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" push -u origin "$TEMP_BRANCH"
+
+# Trigger the workflow
+echo "Triggering GitHub workflow..."
+gh workflow run docker-security-scan.yml -f image_name="$IMAGE_NAME" -f branch_name="$TEMP_BRANCH"
+
+# Wait for the workflow to start
+echo "Waiting for workflow to start..."
+sleep 5
+
+# Find the run ID of the latest workflow run
+WORKFLOW_RUN=$(gh run list --workflow=docker-security-scan.yml --branch="$TEMP_BRANCH" --limit=1 --json databaseId,status,conclusion --jq '.[0]')
+WORKFLOW_ID=$(echo "$WORKFLOW_RUN" | jq -r '.databaseId')
+
+if [[ -z "$WORKFLOW_ID" || "$WORKFLOW_ID" == "null" ]]; then
+  echo "Error: Could not get workflow run ID. Please check your GitHub CLI configuration."
+  exit 1
+fi
+
+echo "Monitoring workflow run ID: $WORKFLOW_ID"
+
+# Poll for completion
+while true; do
+  WORKFLOW_RUN=$(gh run view "$WORKFLOW_ID" --json status,conclusion --jq '.')
+  STATUS=$(echo "$WORKFLOW_RUN" | jq -r '.status')
+  
+  if [[ "$STATUS" == "completed" ]]; then
+    break
+  fi
+  echo "Workflow status: $STATUS"
+  sleep 10
+done
+
+# Check workflow conclusion
+CONCLUSION=$(echo "$WORKFLOW_RUN" | jq -r '.conclusion')
+
+# Clean up
+cd ~
+rm -rf "$TEMP_DIR"
+gh api -X DELETE "repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/git/refs/heads/$TEMP_BRANCH" || echo "Failed to delete temporary branch, it will be cleaned up later"
+
+if [[ "$CONCLUSION" == "success" ]]; then
+  echo "✅ Security scan passed! Pushing image to Docker Hub..."
+  docker push "$IMAGE_NAME"
+  echo "✅ Successfully pushed $IMAGE_NAME to Docker Hub"
+else
+  echo "❌ Security scan failed! Image not pushed to Docker Hub."
+  echo "❌ Check the workflow logs for details: $(gh repo view --json url -q .url)/actions/runs/$WORKFLOW_ID"
 fi
