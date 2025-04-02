@@ -7,8 +7,8 @@ on:
       image_name:
         description: 'Docker image name (including tag)'
         required: true
-      branch_name:
-        description: 'Branch containing the Docker image'
+      tar_file:
+        description: 'Path to the tar file containing the image'
         required: true
 
 jobs:
@@ -17,24 +17,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-        with:
-          ref: ${{ github.event.inputs.branch_name }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Build or pull Docker image
+      - name: Load Docker image
         run: |
-          # If there's a Dockerfile, build the image, otherwise pull from registry
-          if [ -f "Dockerfile" ]; then
-            echo "Building image from Dockerfile"
-            docker build -t ${{ github.event.inputs.image_name }} .
-          else
-            echo "Pulling image from registry"
-            docker pull ${{ github.event.inputs.image_name }}
-          fi
+          # Create a directory for the tar file
+          mkdir -p /tmp/docker-images
+          # Copy the tar file to the runner
+          cp ${{ github.event.inputs.tar_file }} /tmp/docker-images/image.tar
+          # Load the image
+          docker load -i /tmp/docker-images/image.tar
           # Verify the image is loaded
-          docker image ls ${{ github.event.inputs.image_name }}
+          docker image ls
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
@@ -49,38 +45,21 @@ jobs:
 
       - name: Upload Trivy scan results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: trivy-results
           path: trivy-results.txt
 
-      - name: Generate HTML report
-        if: always()
-        run: |
-          echo "<html><head><title>Security Scan Results</title>" > report.html
-          echo "<style>body{font-family:sans-serif;margin:20px} h1{color:#333} pre{background:#f5f5f5;padding:10px;border-radius:5px;overflow:auto}</style>" >> report.html
-          echo "</head><body>" >> report.html
-          echo "<h1>Security Scan Results for ${{ github.event.inputs.image_name }}</h1>" >> report.html
-          echo "<h2>Scan completed on $(date)</h2>" >> report.html
-          echo "<pre>" >> report.html
-          cat trivy-results.txt >> report.html 2>/dev/null || echo "No results file found" >> report.html
-          echo "</pre>" >> report.html
-          echo "</body></html>" >> report.html
-
-      - name: Upload HTML report
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Log in to Docker Hub
+        if: success()
+        uses: docker/login-action@v2
         with:
-          name: security-report
-          path: report.html
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Scan summary
-        if: always()
+      - name: Push to Docker Hub
+        if: success()
         run: |
-          if [ "${{ job.status }}" == "success" ]; then
-            echo "✅ Security scan passed for ${{ github.event.inputs.image_name }}"
-          else
-            echo "❌ Security scan failed for ${{ github.event.inputs.image_name }}"
-            echo "See detailed results in the artifacts"
-            exit 1
-          fi
+          echo "Pushing image to Docker Hub..."
+          docker push ${{ github.event.inputs.image_name }}
+          echo "Image successfully pushed to Docker Hub!"
