@@ -55,7 +55,7 @@ if [[ "$1" == "push" ]]; then
     echo "✅ Successfully pushed $IMAGE_NAME to Docker Hub"
   else
     echo "❌ Security scan failed! Image not pushed to Docker Hub."
-    echo "❌ Check the workflow logs for details: https://github.com/YOUR_USERNAME/YOUR_REPO/actions/runs/$WORKFLOW_ID"
+    echo "❌ Check the workflow logs for details: https://github.com/Rishab9054/DockerImagerScanner/actions/runs/$WORKFLOW_ID"
   fi
   
   # Clean up
