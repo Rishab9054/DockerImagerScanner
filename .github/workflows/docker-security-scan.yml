@@ -1,83 +1,76 @@
-name: Docker CI/CD with Trivy
+name: Docker Image Security Scan
 
 on:
   workflow_dispatch:
+    inputs:
+      image_name:
+        description: 'Docker image name (e.g., user/app:tag)'
+        required: true
+        type: string
+      tar_file:
+        description: 'Path to saved Docker image tarball (e.g., /tmp/image.tar)'
+        required: true
+        type: string
+
   push:
     branches: [ "main" ]
 
 jobs:
-  build-scan-push:
+  scan-and-push:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
 
-      - name: Build the Docker image
-        id: build-image
-        run: |
-          # Get repository name without owner (e.g., "repo" from "owner/repo")
-          REPO_NAME=$(echo "${{ github.repository }}" | cut -d '/' -f 2)
-          IMAGE_NAME="${{ secrets.DOCKERHUB_USERNAME }}/$REPO_NAME"
-          IMAGE_TAG=${GITHUB_SHA::8}
-          
-          echo "Building image $IMAGE_NAME:$IMAGE_TAG"
-          docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
-          
-          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Run Trivy vulnerability scan
-        id: trivy-scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: "${{ steps.build-image.outputs.IMAGE_NAME }}:${{ steps.build-image.outputs.IMAGE_TAG }}"
-          format: 'table'
-          exit-code: '0'  # Changed to 0 to prevent workflow failure
-          ignore-unfixed: true
-          severity: 'CRITICAL,HIGH'
-          output: 'trivy-results.txt'
+    - name: Load Docker image from tarball
+      run: |
+        echo "Loading image from ${{ github.event.inputs.tar_file }}"
+        docker load -i "${{ github.event.inputs.tar_file }}"
 
-      - name: Save scan results as artifact
-        uses: actions/upload-artifact@v4  # Updated to v4
-        with:
-          name: trivy-scan-results
-          path: trivy-results.txt
-          retention-days: 5
+    - name: Run Trivy vulnerability scan
+      id: trivy-scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: "${{ github.event.inputs.image_name }}"
+        format: 'table'
+        exit-code: '0'  # don't fail the build immediately
+        ignore-unfixed: true
+        severity: 'CRITICAL,HIGH'
+        output: 'trivy-results.txt'
 
-      - name: Check for vulnerabilities
-        id: check-vulns
-        run: |
-          if grep -q "CRITICAL\|HIGH" trivy-results.txt; then
-            echo "VULNERABILITIES_FOUND=true" >> $GITHUB_OUTPUT
-            echo "Critical or high vulnerabilities found!"
-          else
-            echo "VULNERABILITIES_FOUND=false" >> $GITHUB_OUTPUT
-            echo "No critical or high vulnerabilities found."
-          fi
+    - name: Check scan results for vulnerabilities
+      id: check-vulns
+      run: |
+        if grep -q "CRITICAL\|HIGH" trivy-results.txt; then
+          echo "VULNERABILITIES_FOUND=true" >> $GITHUB_OUTPUT
+        else
+          echo "VULNERABILITIES_FOUND=false" >> $GITHUB_OUTPUT
+        fi
 
-      - name: Push the Docker image to Docker Hub
-        if: steps.check-vulns.outputs.VULNERABILITIES_FOUND == 'false'
-        run: |
-          IMAGE_NAME=${{ steps.build-image.outputs.IMAGE_NAME }}
-          IMAGE_TAG=${{ steps.build-image.outputs.IMAGE_TAG }}
-          
-          echo "Pushing image $IMAGE_NAME:$IMAGE_TAG"
-          docker push "$IMAGE_NAME:$IMAGE_TAG"
-          echo "Successfully pushed image: $IMAGE_NAME:$IMAGE_TAG to Docker Hub."
+    - name: Upload scan report
+      uses: actions/upload-artifact@v3
+      with:
+        name: trivy-report
+        path: trivy-results.txt
 
-      - name: Report vulnerability findings
-        if: steps.check-vulns.outputs.VULNERABILITIES_FOUND == 'true'
-        run: |
-          echo "⚠️ Vulnerability scan detected issues. Image will not be pushed to Docker Hub."
-          cat trivy-results.txt
-          exit 1
+    - name: Push Docker image to Docker Hub
+      if: steps.check-vulns.outputs.VULNERABILITIES_FOUND == 'false'
+      run: |
+        echo "No critical/high vulnerabilities found. Pushing image..."
+        docker push "${{ github.event.inputs.image_name }}"
+
+    - name: Fail if vulnerabilities are found
+      if: steps.check-vulns.outputs.VULNERABILITIES_FOUND == 'true'
+      run: |
+        echo "❌ Image has CRITICAL or HIGH vulnerabilities. Not pushing."
+        exit 1
