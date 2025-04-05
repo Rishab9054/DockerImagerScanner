@@ -1,6 +1,7 @@
 name: Docker CI/CD with Trivy
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]
 
