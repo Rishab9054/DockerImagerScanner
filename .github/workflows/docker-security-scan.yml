@@ -1,76 +1,97 @@
-name: Docker Image Security Scan
+name: Docker Image Security Scanner
 
 on:
-  workflow_dispatch:
-    inputs:
-      image_name:
-        description: 'Docker image name (e.g., user/app:tag)'
-        required: true
-        type: string
-      tar_file:
-        description: 'Path to saved Docker image tarball (e.g., /tmp/image.tar)'
-        required: true
-        type: string
-
-  push:
-    branches: [ "main" ]
+  repository_dispatch:
+    types: [docker-scan-request]
 
 jobs:
-  scan-and-push:
+  scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Needed to write scan results
+    
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
 
-    - name: Checkout repository
-      uses: actions/checkout@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Pull Docker image
+        run: |
+          echo "Pulling ${{ github.event.client_payload.image_name }}:${{ github.event.client_payload.image_tag }}"
+          docker pull ${{ github.event.client_payload.image_name }}:${{ github.event.client_payload.image_tag }}
+      
+      - name: Set up Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      
+      - name: Scan Docker image with Trivy
+        id: scan
+        continue-on-error: true
+        run: |
+          mkdir -p scan-results
+          IMAGE_NAME="${{ github.event.client_payload.image_name }}:${{ github.event.client_payload.image_tag }}"
+          trivy image --format json --output scan-results/raw_results.json $IMAGE_NAME
+          echo "TRIVY_EXIT_CODE=$?" >> $GITHUB_ENV
+      
+      - name: Process scan results
+        run: |
+          python -c "
+import json
+import os
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+# Load Trivy results
+with open('scan-results/raw_results.json', 'r') as f:
+    data = json.load(f)
 
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v2
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
+# Initialize result structure
+result = {
+    'status': 'success',
+    'image': '${{ github.event.client_payload.image_name }}:${{ github.event.client_payload.image_tag }}',
+    'vulnerabilities': []
+}
 
-    - name: Load Docker image from tarball
-      run: |
-        echo "Loading image from ${{ github.event.inputs.tar_file }}"
-        docker load -i "${{ github.event.inputs.tar_file }}"
+# Process vulnerabilities
+has_critical = False
+for result_item in data.get('Results', []):
+    for vuln in result_item.get('Vulnerabilities', []):
+        if vuln.get('Severity') in ['CRITICAL', 'HIGH']:
+            has_critical = True
+            result['vulnerabilities'].append(f\"{vuln.get('VulnerabilityID')}: {vuln.get('Severity')} - {vuln.get('Title')}\")
 
-    - name: Run Trivy vulnerability scan
-      id: trivy-scan
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: "${{ github.event.inputs.image_name }}"
-        format: 'table'
-        exit-code: '0'  # don't fail the build immediately
-        ignore-unfixed: true
-        severity: 'CRITICAL,HIGH'
-        output: 'trivy-results.txt'
+# Set overall status
+if has_critical or int(os.environ.get('TRIVY_EXIT_CODE', '0')) != 0:
+    result['status'] = 'failure'
 
-    - name: Check scan results for vulnerabilities
-      id: check-vulns
-      run: |
-        if grep -q "CRITICAL\|HIGH" trivy-results.txt; then
-          echo "VULNERABILITIES_FOUND=true" >> $GITHUB_OUTPUT
-        else
-          echo "VULNERABILITIES_FOUND=false" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Upload scan report
-      uses: actions/upload-artifact@v4
-      with:
-        name: trivy-report
-        path: trivy-results.txt
-
-    - name: Push Docker image to Docker Hub
-      if: steps.check-vulns.outputs.VULNERABILITIES_FOUND == 'false'
-      run: |
-        echo "No critical/high vulnerabilities found. Pushing image..."
-        docker push "${{ github.event.inputs.image_name }}"
-
-    - name: Fail if vulnerabilities are found
-      if: steps.check-vulns.outputs.VULNERABILITIES_FOUND == 'true'
-      run: |
-        echo "❌ Image has CRITICAL or HIGH vulnerabilities. Not pushing."
-        exit 1
+# Write results to file
+with open(f\"scan-results/${{ github.event.client_payload.run_id }}.json\", 'w') as f:
+    json.dump(result, f)
+          "
+      
+      - name: Commit and push results
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          mkdir -p scan-results
+          
+          git add scan-results/${{ github.event.client_payload.run_id }}.json
+          git commit -m "Add scan results for ${{ github.event.client_payload.image_name }}:${{ github.event.client_payload.image_tag }}"
+          git push
